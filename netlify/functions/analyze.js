@@ -1,15 +1,18 @@
 exports.handler = async function (event, context) {
-  // Only allow POST
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: "Method Not Allowed" };
   }
 
-  // CORS headers - allows your frontend to call this function
   const headers = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type",
     "Content-Type": "application/json",
   };
+
+  // Handle CORS preflight
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 200, headers, body: "" };
+  }
 
   try {
     const { word } = JSON.parse(event.body);
@@ -17,8 +20,8 @@ exports.handler = async function (event, context) {
       return { statusCode: 400, headers, body: JSON.stringify({ error: "No word provided" }) };
     }
 
-    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-    if (!GEMINI_API_KEY) {
+    const GROQ_API_KEY = process.env.GROQ_API_KEY;
+    if (!GROQ_API_KEY) {
       return { statusCode: 500, headers, body: JSON.stringify({ error: "API key not configured" }) };
     }
 
@@ -107,50 +110,49 @@ RULES:
 - Give 3 memory tips
 - Bold key words in sentences using **word** syntax
 - Focus on mistakes Bangladeshi learners make
-- Respond ONLY with JSON, nothing else, no markdown`;
+- Respond ONLY with JSON, nothing else, no markdown, no backticks`;
 
-    const requestBody = {
-      system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
-      contents: [{ parts: [{ text: `Analyze this English word deeply for a Bangladeshi student: "${word}"` }] }],
-      generationConfig: {
-        temperature: 0.4,
-        maxOutputTokens: 2500,
+    const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${GROQ_API_KEY}`,
       },
-    };
+      body: JSON.stringify({
+        model: "llama-3.3-70b-versatile",
+        temperature: 0.4,
+        max_tokens: 2500,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: `Analyze this English word deeply for a Bangladeshi student: "${word}"` }
+        ],
+      }),
+    });
 
-    const geminiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody),
-      }
-    );
+    const groqData = await groqRes.json();
 
-    const geminiData = await geminiRes.json();
-
-    if (!geminiRes.ok) {
-      console.error("Gemini error:", geminiData);
+    if (!groqRes.ok) {
+      console.error("Groq error:", JSON.stringify(groqData));
       return {
         statusCode: 502,
         headers,
-        body: JSON.stringify({ error: "Gemini API error", details: geminiData }),
+        body: JSON.stringify({ error: "Groq API error", details: groqData }),
       };
     }
 
-    const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const rawText = groqData?.choices?.[0]?.message?.content || "";
 
     // Clean markdown fences if any
     let clean = rawText.trim();
     clean = clean.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
 
-    // Validate JSON
-    JSON.parse(clean); // will throw if invalid
+    // Validate JSON — will throw if invalid
+    JSON.parse(clean);
 
     return { statusCode: 200, headers, body: clean };
 
   } catch (err) {
-    console.error("Function error:", err);
+    console.error("Function error:", err.message);
     return {
       statusCode: 500,
       headers,
