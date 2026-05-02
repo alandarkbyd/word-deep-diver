@@ -121,7 +121,7 @@ RULES:
       body: JSON.stringify({
         model: "llama-3.3-70b-versatile",
         temperature: 0.4,
-        max_tokens: 2500,
+        max_tokens: 9000,
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: `Analyze this English word deeply for a Bangladeshi student: "${word}"` }
