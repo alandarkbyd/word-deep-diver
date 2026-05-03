@@ -1,4 +1,15 @@
 exports.handler = async function (event, context) {
+  if (event.httpMethod === "OPTIONS") {
+    return {
+      statusCode: 200,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type",
+      },
+      body: "",
+    };
+  }
+
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: "Method Not Allowed" };
   }
@@ -9,21 +20,35 @@ exports.handler = async function (event, context) {
     "Content-Type": "application/json",
   };
 
-  // Handle CORS preflight
-  if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 200, headers, body: "" };
-  }
-
   try {
     const { word } = JSON.parse(event.body);
     if (!word) {
-      return { statusCode: 400, headers, body: JSON.stringify({ error: "No word provided" }) };
+      return {
+        statusCode: 400,
+        headers,
+        body: JSON.stringify({ error: "No word provided" }),
+      };
     }
 
     const GROQ_API_KEY = process.env.GROQ_API_KEY;
     if (!GROQ_API_KEY) {
-      return { statusCode: 500, headers, body: JSON.stringify({ error: "API key not configured" }) };
+      return {
+        statusCode: 500,
+        headers,
+        body: JSON.stringify({ error: "API key not configured" }),
+      };
     }
+
+    // ── FALLBACK MODEL LIST ──
+    // একটা model এ limit বা error হলে automatically পরেরটায় চলে যাবে।
+    // সবগুলো Groq এ free।
+    const MODELS = [
+      "llama-3.3-70b-versatile",   // সেরা quality, আগে try করবে
+      "llama3-70b-8192",           // Fallback 1
+      "llama3-8b-8192",            // Fallback 2 — দ্রুত, একটু কম quality
+      "gemma2-9b-it",              // Fallback 3
+      "mixtral-8x7b-32768",        // Fallback 4
+    ];
 
     const SYSTEM_PROMPT = `You are an expert English linguistics teacher specializing in collocations, word meanings, and usage patterns. Your student is Bangladeshi and learning English.
 
@@ -112,44 +137,87 @@ RULES:
 - Focus on mistakes Bangladeshi learners make
 - Respond ONLY with JSON, nothing else, no markdown, no backticks`;
 
-    const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        temperature: 0.4,
-        max_tokens: 9000,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: `Analyze this English word deeply for a Bangladeshi student: "${word}"` }
-        ],
-      }),
-    });
+    // ── প্রতিটা model একে একে try করো ──
+    let lastError = null;
 
-    const groqData = await groqRes.json();
+    for (const model of MODELS) {
+      try {
+        console.log(`Trying model: ${model}`);
 
-    if (!groqRes.ok) {
-      console.error("Groq error:", JSON.stringify(groqData));
-      return {
-        statusCode: 502,
-        headers,
-        body: JSON.stringify({ error: "Groq API error", details: groqData }),
-      };
+        const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${GROQ_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: model,
+            temperature: 0.4,
+            max_tokens: 4000,
+            messages: [
+              { role: "system", content: SYSTEM_PROMPT },
+              {
+                role: "user",
+                content: `Analyze this English word deeply for a Bangladeshi student: "${word}"`,
+              },
+            ],
+          }),
+        });
+
+        const groqData = await groqRes.json();
+
+        // Rate limit বা model unavailable হলে পরেরটায় যাও
+        if (!groqRes.ok) {
+          const errCode = groqData?.error?.code || groqData?.error?.type || groqRes.status;
+          console.warn(`Model ${model} failed: ${errCode}. Trying next...`);
+          lastError = groqData;
+          continue;
+        }
+
+        const rawText = groqData?.choices?.[0]?.message?.content || "";
+
+        // Markdown fence clean করো
+        let clean = rawText.trim();
+        clean = clean
+          .replace(/^```json\s*/i, "")
+          .replace(/^```\s*/i, "")
+          .replace(/```\s*$/i, "")
+          .trim();
+
+        // JSON valid কিনা check করো — না হলে পরেরটায় যাও
+        try {
+          JSON.parse(clean);
+        } catch (parseErr) {
+          console.warn(`Model ${model} returned invalid JSON. Trying next...`);
+          lastError = { error: "Invalid JSON from model" };
+          continue;
+        }
+
+        // সফল — result পাঠাও
+        console.log(`Success with model: ${model}`);
+        return {
+          statusCode: 200,
+          headers: { ...headers, "X-Model-Used": model },
+          body: clean,
+        };
+
+      } catch (fetchErr) {
+        console.warn(`Model ${model} fetch error: ${fetchErr.message}. Trying next...`);
+        lastError = { error: fetchErr.message };
+        continue;
+      }
     }
 
-    const rawText = groqData?.choices?.[0]?.message?.content || "";
-
-    // Clean markdown fences if any
-    let clean = rawText.trim();
-    clean = clean.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
-
-    // Validate JSON — will throw if invalid
-    JSON.parse(clean);
-
-    return { statusCode: 200, headers, body: clean };
+    // সব model fail করলে
+    console.error("All models failed:", JSON.stringify(lastError));
+    return {
+      statusCode: 503,
+      headers,
+      body: JSON.stringify({
+        error: "সব models এ সমস্যা হচ্ছে। কিছুক্ষণ পর try করো।",
+        details: lastError,
+      }),
+    };
 
   } catch (err) {
     console.error("Function error:", err.message);
