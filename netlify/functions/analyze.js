@@ -30,25 +30,16 @@ exports.handler = async function (event, context) {
       };
     }
 
+    const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
     const GROQ_API_KEY = process.env.GROQ_API_KEY;
-    if (!GROQ_API_KEY) {
+
+    if (!OPENROUTER_API_KEY && !GROQ_API_KEY) {
       return {
         statusCode: 500,
         headers,
-        body: JSON.stringify({ error: "API key not configured" }),
+        body: JSON.stringify({ error: "No API key configured" }),
       };
     }
-
-    // ── FALLBACK MODEL LIST ──
-    // একটা model এ limit বা error হলে automatically পরেরটায় চলে যাবে।
-    // সবগুলো Groq এ free।
-    const MODELS = [
-      "llama-3.3-70b-versatile",   // সেরা quality, আগে try করবে
-      "llama3-70b-8192",           // Fallback 1
-      "llama3-8b-8192",            // Fallback 2 — দ্রুত, একটু কম quality
-      "gemma2-9b-it",              // Fallback 3
-      "mixtral-8x7b-32768",        // Fallback 4
-    ];
 
     const SYSTEM_PROMPT = `You are an expert English linguistics teacher specializing in collocations, word meanings, and usage patterns. Your student is Bangladeshi and learning English.
 
@@ -137,85 +128,155 @@ RULES:
 - Focus on mistakes Bangladeshi learners make
 - Respond ONLY with JSON, nothing else, no markdown, no backticks`;
 
-    // ── প্রতিটা model একে একে try করো ──
-    let lastError = null;
+    const USER_MESSAGE = `Analyze this English word deeply for a Bangladeshi student: "${word}"`;
 
-    for (const model of MODELS) {
-      try {
-        console.log(`Trying model: ${model}`);
+    // ════════════════════════════════════════════
+    // PRIORITY 1 — OpenRouter (Claude free models)
+    // ════════════════════════════════════════════
+    const OPENROUTER_MODELS = [
+      "anthropic/claude-haiku-4-5",          // Claude Haiku — best free option
+      "anthropic/claude-3-haiku",             // Claude 3 Haiku fallback
+      "google/gemini-2.0-flash-exp:free",     // Gemini free
+      "meta-llama/llama-3.3-70b-instruct:free", // Llama free
+      "mistralai/mistral-7b-instruct:free",   // Mistral free
+    ];
 
-        const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${GROQ_API_KEY}`,
-          },
-          body: JSON.stringify({
-            model: model,
-            temperature: 0.4,
-            max_tokens: 4000,
-            messages: [
-              { role: "system", content: SYSTEM_PROMPT },
-              {
-                role: "user",
-                content: `Analyze this English word deeply for a Bangladeshi student: "${word}"`,
-              },
-            ],
-          }),
-        });
-
-        const groqData = await groqRes.json();
-
-        // Rate limit বা model unavailable হলে পরেরটায় যাও
-        if (!groqRes.ok) {
-          const errCode = groqData?.error?.code || groqData?.error?.type || groqRes.status;
-          console.warn(`Model ${model} failed: ${errCode}. Trying next...`);
-          lastError = groqData;
-          continue;
-        }
-
-        const rawText = groqData?.choices?.[0]?.message?.content || "";
-
-        // Markdown fence clean করো
-        let clean = rawText.trim();
-        clean = clean
-          .replace(/^```json\s*/i, "")
-          .replace(/^```\s*/i, "")
-          .replace(/```\s*$/i, "")
-          .trim();
-
-        // JSON valid কিনা check করো — না হলে পরেরটায় যাও
+    if (OPENROUTER_API_KEY) {
+      for (const model of OPENROUTER_MODELS) {
         try {
-          JSON.parse(clean);
-        } catch (parseErr) {
-          console.warn(`Model ${model} returned invalid JSON. Trying next...`);
-          lastError = { error: "Invalid JSON from model" };
+          console.log(`[OpenRouter] Trying: ${model}`);
+
+          const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+              "HTTP-Referer": "https://analize-word.netlify.app",
+              "X-Title": "Word Deep Diver",
+            },
+            body: JSON.stringify({
+              model: model,
+              temperature: 0.4,
+              max_tokens: 4000,
+              messages: [
+                { role: "system", content: SYSTEM_PROMPT },
+                { role: "user", content: USER_MESSAGE },
+              ],
+            }),
+          });
+
+          const data = await res.json();
+
+          if (!res.ok) {
+            const errMsg = data?.error?.message || res.status;
+            console.warn(`[OpenRouter] ${model} failed: ${errMsg}. Trying next...`);
+            continue;
+          }
+
+          const rawText = data?.choices?.[0]?.message?.content || "";
+          let clean = rawText.trim()
+            .replace(/^```json\s*/i, "")
+            .replace(/^```\s*/i, "")
+            .replace(/```\s*$/i, "")
+            .trim();
+
+          try {
+            JSON.parse(clean);
+          } catch {
+            console.warn(`[OpenRouter] ${model} returned invalid JSON. Trying next...`);
+            continue;
+          }
+
+          console.log(`[OpenRouter] Success: ${model}`);
+          return {
+            statusCode: 200,
+            headers: { ...headers, "X-Model-Used": model },
+            body: clean,
+          };
+
+        } catch (err) {
+          console.warn(`[OpenRouter] ${model} error: ${err.message}. Trying next...`);
           continue;
         }
-
-        // সফল — result পাঠাও
-        console.log(`Success with model: ${model}`);
-        return {
-          statusCode: 200,
-          headers: { ...headers, "X-Model-Used": model },
-          body: clean,
-        };
-
-      } catch (fetchErr) {
-        console.warn(`Model ${model} fetch error: ${fetchErr.message}. Trying next...`);
-        lastError = { error: fetchErr.message };
-        continue;
       }
     }
 
-    // সব model fail করলে
-    console.error("All models failed:", JSON.stringify(lastError));
+    // ════════════════════════════════════════════
+    // PRIORITY 2 — Groq fallback (if OpenRouter fails)
+    // ════════════════════════════════════════════
+    const GROQ_MODELS = [
+      "llama-3.3-70b-versatile",
+      "llama3-70b-8192",
+      "llama3-8b-8192",
+      "gemma2-9b-it",
+      "mixtral-8x7b-32768",
+    ];
+
+    if (GROQ_API_KEY) {
+      for (const model of GROQ_MODELS) {
+        try {
+          console.log(`[Groq] Trying: ${model}`);
+
+          const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${GROQ_API_KEY}`,
+            },
+            body: JSON.stringify({
+              model: model,
+              temperature: 0.4,
+              max_tokens: 4000,
+              messages: [
+                { role: "system", content: SYSTEM_PROMPT },
+                { role: "user", content: USER_MESSAGE },
+              ],
+            }),
+          });
+
+          const data = await res.json();
+
+          if (!res.ok) {
+            const errMsg = data?.error?.message || res.status;
+            console.warn(`[Groq] ${model} failed: ${errMsg}. Trying next...`);
+            continue;
+          }
+
+          const rawText = data?.choices?.[0]?.message?.content || "";
+          let clean = rawText.trim()
+            .replace(/^```json\s*/i, "")
+            .replace(/^```\s*/i, "")
+            .replace(/```\s*$/i, "")
+            .trim();
+
+          try {
+            JSON.parse(clean);
+          } catch {
+            console.warn(`[Groq] ${model} returned invalid JSON. Trying next...`);
+            continue;
+          }
+
+          console.log(`[Groq] Success: ${model}`);
+          return {
+            statusCode: 200,
+            headers: { ...headers, "X-Model-Used": model },
+            body: clean,
+          };
+
+        } catch (err) {
+          console.warn(`[Groq] ${model} error: ${err.message}. Trying next...`);
+          continue;
+        }
+      }
+    }
+
+    // সব fail হলে
+    console.error("All models and providers failed.");
     return {
       statusCode: 503,
       headers,
       body: JSON.stringify({
         error: "সব models এ সমস্যা হচ্ছে। কিছুক্ষণ পর try করো।",
-        details: lastError,
       }),
     };
 
